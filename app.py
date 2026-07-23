@@ -1,11 +1,13 @@
 """
-문법 카드 이미지 생성기 (Streamlit)
-- grammar_content.xlsx 의 3개 시트를 읽어서
-  rule_reminder.png / error_spotlight.png / practice_ref.png 로 렌더링/다운로드
+Cell 통합 카드 이미지 생성기 (Streamlit)
+
+엑셀 업로드 -> 시트 3개(Rule Reminder Card / Error Spotlight / 교재 Practice 문항)를
+'챕터' + 'Cell (개념)' 기준으로 묶어서, 각 Cell마다
+[Rule Reminder + Error Spotlight + Practice] 를 하나로 쌓은 통합 이미지 1장을 생성한다.
 """
 import io
-import textwrap
-from pathlib import Path
+import re
+import zipfile
 
 import pandas as pd
 import streamlit as st
@@ -14,47 +16,105 @@ from PIL import Image, ImageDraw, ImageFont
 # ------------------------------------------------------------------
 # 기본 설정
 # ------------------------------------------------------------------
-EXCEL_PATH = Path(__file__).parent / "grammar_content.xlsx"
-
 FONT_REGULAR = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
 FONT_BOLD = "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"
 
-HEADER_BG = (185, 166, 222)      # 이미지의 연보라색 헤더
-HEADER_FG = (30, 30, 30)
+TOTAL_WIDTH = 1400
+PAD = 16
+LINE_H = 24
+
+RULE_COLOR = (185, 166, 222)      # 연보라
+ERROR_COLOR = (233, 165, 165)     # 연분홍
+PRACTICE_COLOR = (163, 209, 181)  # 연초록
+ALT_BG = (247, 247, 250)
 BODY_BG = (255, 255, 255)
-ALT_BG = (247, 245, 251)
-BORDER_COLOR = (170, 160, 190)
+BORDER_COLOR = (190, 190, 190)
 TEXT_COLOR = (35, 35, 35)
 
-SHEETS = {
-    "rule_reminder": {
-        "title": "■ Rule Reminder Card",
-        "center_cols": [0],
-    },
-    "error_spotlight": {
-        "title": "■ Error Spotlight",
-        "center_cols": [0, 3],
-    },
-    "practice_ref": {
-        "title": "■ 교재 Practice 문항",
-        "center_cols": [0],
-    },
+# 시트를 찾기 위한 키워드 (시트 이름이 조금 달라도 매칭되도록)
+SHEET_KEYWORDS = {
+    "rule": ["rule reminder", "rule_reminder"],
+    "error": ["error spotlight", "error_spotlight"],
+    "practice": ["practice"],
 }
 
-st.set_page_config(page_title="문법 카드 이미지 생성기", layout="wide")
+SECTION_META = {
+    "rule": {"label": "Rule Reminder", "color": RULE_COLOR, "center_cols": [0]},
+    "error": {"label": "Error Spotlight", "color": ERROR_COLOR, "center_cols": [0, 3]},
+    "practice": {"label": "Practice", "color": PRACTICE_COLOR, "center_cols": [0]},
+}
+
+st.set_page_config(page_title="Cell 통합 카드 생성기", layout="wide")
 
 
 # ------------------------------------------------------------------
-# 데이터 로드
+# 엑셀 로드 & 정리
 # ------------------------------------------------------------------
+def find_sheet(sheet_names, keywords):
+    for name in sheet_names:
+        low = name.lower()
+        if any(k in low for k in keywords):
+            return name
+    return None
+
+
 @st.cache_data
-def load_sheets(path: str):
-    xls = pd.ExcelFile(path)
-    return {name: xls.parse(name).fillna("") for name in xls.sheet_names}
+def load_and_prepare(file_bytes):
+    xls = pd.ExcelFile(io.BytesIO(file_bytes))
+    sheet_names = xls.sheet_names
+
+    dfs = {}
+    for key, keywords in SHEET_KEYWORDS.items():
+        sheet = find_sheet(sheet_names, keywords)
+        if sheet is None:
+            dfs[key] = None
+            continue
+        # 1행은 제목(합쳐진 셀), 2행이 실제 컬럼 헤더
+        df = xls.parse(sheet, header=1)
+        df = df.dropna(how="all")
+        # 첫 두 컬럼(챕터, Cell(개념))은 병합 셀 -> 앞쪽 값으로 채움
+        df.iloc[:, 0] = df.iloc[:, 0].ffill()
+        df.iloc[:, 1] = df.iloc[:, 1].ffill()
+        df = df.fillna("")
+        dfs[key] = df
+    return dfs
+
+
+def ordered_pairs(df):
+    """(챕터, Cell) 조합을 최초 등장 순서대로 반환."""
+    if df is None:
+        return []
+    pairs = df.iloc[:, [0, 1]].drop_duplicates()
+    return list(pairs.itertuples(index=False, name=None))
+
+
+def build_groups(dfs):
+    """모든 시트를 통틀어 (챕터, Cell) 그룹 목록 생성 (등장 순서 유지)."""
+    seen = []
+    seen_set = set()
+    for key in ["rule", "error", "practice"]:
+        for pair in ordered_pairs(dfs.get(key)):
+            if pair not in seen_set:
+                seen_set.add(pair)
+                seen.append(pair)
+
+    groups = []
+    for chapter, cell in seen:
+        entry = {"chapter": chapter, "cell": cell}
+        for key in ["rule", "error", "practice"]:
+            df = dfs.get(key)
+            if df is None:
+                entry[key] = None
+                continue
+            sub = df[(df.iloc[:, 0] == chapter) & (df.iloc[:, 1] == cell)]
+            content_cols = df.columns[2:]
+            entry[key] = sub[content_cols].reset_index(drop=True)
+        groups.append(entry)
+    return groups
 
 
 # ------------------------------------------------------------------
-# 이미지 렌더링
+# 이미지 렌더링 (표 하나)
 # ------------------------------------------------------------------
 def _font(size, bold=False):
     return ImageFont.truetype(FONT_BOLD if bold else FONT_REGULAR, size)
@@ -66,7 +126,6 @@ def _wrap_text(draw, text, font, max_width):
         if raw_line == "":
             lines.append("")
             continue
-        words = list(raw_line)  # 한글/영문 혼용 -> 글자 단위 wrap이 더 안전
         current = ""
         for ch in raw_line:
             trial = current + ch
@@ -80,167 +139,209 @@ def _wrap_text(draw, text, font, max_width):
     return lines
 
 
-def render_table_image(title, df, center_cols=None, col_width_ratios=None):
-    center_cols = center_cols or []
+def render_section_image(label, color, df, col_width_ratios, center_cols):
+    """섹션 하나(label 배너 + 표)를 이미지로 렌더링. df가 비어있으면 None 반환."""
+    if df is None or len(df) == 0:
+        return None
+
     n_cols = len(df.columns)
-    col_width_ratios = col_width_ratios or [1] * n_cols
-
-    total_width = 1400
-    pad = 16
-    header_font = _font(18, bold=True)
-    body_font = _font(17)
-    title_font = _font(22, bold=True)
-
     ratio_sum = sum(col_width_ratios)
-    col_widths = [int(total_width * r / ratio_sum) for r in col_width_ratios]
+    col_widths = [int(TOTAL_WIDTH * r / ratio_sum) for r in col_width_ratios]
 
-    dummy_img = Image.new("RGB", (10, 10))
-    dummy_draw = ImageDraw.Draw(dummy_img)
+    header_font = _font(17, bold=True)
+    body_font = _font(16)
+    label_font = _font(16, bold=True)
 
-    # 각 셀의 wrap된 줄과 행 높이 계산
-    header_lines = []
-    for c, col in enumerate(df.columns):
-        lines = _wrap_text(dummy_draw, str(col), header_font, col_widths[c] - 2 * pad)
-        header_lines.append(lines)
-    header_row_h = max(len(l) for l in header_lines) * 24 + 2 * pad
+    dummy = ImageDraw.Draw(Image.new("RGB", (10, 10)))
+
+    header_lines = [
+        _wrap_text(dummy, str(col), header_font, col_widths[c] - 2 * PAD)
+        for c, col in enumerate(df.columns)
+    ]
+    header_h = max(len(l) for l in header_lines) * LINE_H + 2 * PAD
 
     body_rows_lines = []
     body_row_heights = []
     for _, row in df.iterrows():
         row_lines = []
         for c in range(n_cols):
-            lines = _wrap_text(dummy_draw, row.iloc[c], body_font, col_widths[c] - 2 * pad)
+            lines = _wrap_text(dummy, row.iloc[c], body_font, col_widths[c] - 2 * PAD)
             row_lines.append(lines)
-        h = max(len(l) for l in row_lines) * 24 + 2 * pad
+        h = max(len(l) for l in row_lines) * LINE_H + 2 * PAD
         body_rows_lines.append(row_lines)
         body_row_heights.append(h)
 
-    title_h = 44
-    total_height = title_h + header_row_h + sum(body_row_heights) + 20
+    label_h = 34
+    total_h = label_h + header_h + sum(body_row_heights)
 
-    img = Image.new("RGB", (total_width, total_height), BODY_BG)
+    img = Image.new("RGB", (TOTAL_WIDTH, total_h), BODY_BG)
     draw = ImageDraw.Draw(img)
 
-    # 제목
-    draw.text((4, 6), title, font=title_font, fill=(20, 20, 20))
-    y = title_h
+    # 섹션 라벨 배너
+    draw.rectangle([0, 0, TOTAL_WIDTH, label_h], fill=color)
+    draw.text((PAD, 7), label, font=label_font, fill=(20, 20, 20))
+    y = label_h
 
-    # 헤더
+    # 표 헤더
+    light = tuple(min(255, int(c + (255 - c) * 0.65)) for c in color)
+    draw.rectangle([0, y, TOTAL_WIDTH, y + header_h], fill=light)
     x = 0
-    draw.rectangle([0, y, total_width, y + header_row_h], fill=HEADER_BG)
     for c, col in enumerate(df.columns):
         lines = header_lines[c]
-        block_h = len(lines) * 24
-        ty = y + (header_row_h - block_h) // 2
+        block_h = len(lines) * LINE_H
+        ty = y + (header_h - block_h) // 2
         for line in lines:
             tw = draw.textlength(line, font=header_font)
             tx = x + (col_widths[c] - tw) // 2
-            draw.text((tx, ty), line, font=header_font, fill=HEADER_FG)
-            ty += 24
+            draw.text((tx, ty), line, font=header_font, fill=(20, 20, 20))
+            ty += LINE_H
         x += col_widths[c]
-    y += header_row_h
+    y += header_h
 
-    # 본문
+    # 표 본문
     for r, row_lines in enumerate(body_rows_lines):
         row_h = body_row_heights[r]
         bg = ALT_BG if r % 2 == 1 else BODY_BG
-        draw.rectangle([0, y, total_width, y + row_h], fill=bg)
+        draw.rectangle([0, y, TOTAL_WIDTH, y + row_h], fill=bg)
         x = 0
         for c, lines in enumerate(row_lines):
-            block_h = len(lines) * 24
+            block_h = len(lines) * LINE_H
             ty = y + (row_h - block_h) // 2
             centered = c in center_cols
             for line in lines:
                 tw = draw.textlength(line, font=body_font)
-                tx = x + (col_widths[c] - tw) // 2 if centered else x + pad
+                tx = x + (col_widths[c] - tw) // 2 if centered else x + PAD
                 draw.text((tx, ty), line, font=body_font, fill=TEXT_COLOR)
-                ty += 24
+                ty += LINE_H
             x += col_widths[c]
         y += row_h
 
-    # 테이블 외곽/구분선
+    # 구분선 / 외곽선
     x = 0
     for w in col_widths[:-1]:
         x += w
-        draw.line([(x, title_h), (x, total_height - 20)], fill=BORDER_COLOR, width=1)
-    draw.rectangle([0, title_h, total_width - 1, total_height - 20], outline=BORDER_COLOR, width=2)
-    draw.line([(0, title_h + header_row_h), (total_width, title_h + header_row_h)],
-               fill=BORDER_COLOR, width=2)
+        draw.line([(x, label_h), (x, total_h)], fill=BORDER_COLOR, width=1)
+    draw.line([(0, label_h + header_h), (TOTAL_WIDTH, label_h + header_h)],
+              fill=BORDER_COLOR, width=1)
+    draw.rectangle([0, 0, TOTAL_WIDTH - 1, total_h - 1], outline=BORDER_COLOR, width=1)
 
     return img
 
 
 COL_RATIOS = {
-    "rule_reminder": [1, 3.3],
-    "error_spotlight": [1.2, 1.6, 1.6, 1.4],
-    "practice_ref": [0.5, 2.6, 3.0],
+    "rule": [1, 3.3],
+    "error": [1.2, 1.6, 1.6, 1.4],
+    "practice": [0.9, 2.6, 3.0],
 }
 
+GAP = 14  # 섹션 사이 여백
+
+
+def render_combined_cell_image(group):
+    sections = []
+    for key in ["rule", "error", "practice"]:
+        meta = SECTION_META[key]
+        img = render_section_image(
+            meta["label"], meta["color"], group.get(key),
+            COL_RATIOS[key], meta["center_cols"],
+        )
+        if img is not None:
+            sections.append(img)
+
+    if not sections:
+        return None
+
+    total_h = sum(s.height for s in sections) + GAP * (len(sections) - 1)
+    combined = Image.new("RGB", (TOTAL_WIDTH, total_h), BODY_BG)
+    y = 0
+    for i, s in enumerate(sections):
+        combined.paste(s, (0, y))
+        y += s.height
+        if i < len(sections) - 1:
+            y += GAP
+    return combined
+
+
+def safe_filename(chapter, cell):
+    text = f"{chapter}_{cell}"
+    text = re.sub(r"[^0-9A-Za-z가-힣]+", "_", text).strip("_")
+    return text
+
 
 # ------------------------------------------------------------------
-# 메인 화면
+# 화면
 # ------------------------------------------------------------------
-st.title("📘 문법 카드 이미지 생성기")
-st.caption("grammar_content.xlsx 의 세 시트를 읽어서 rule_reminder / error_spotlight / practice_ref 이미지를 만듭니다.")
+def main():
+    st.title("📘 Cell 통합 카드 이미지 생성기")
+    st.caption(
+        "엑셀을 업로드하면 '챕터 + Cell(개념)' 단위로 Rule Reminder / Error Spotlight / "
+        "Practice 내용을 하나로 합친 이미지를 Cell마다 1장씩 만들어 드립니다."
+    )
 
-if not EXCEL_PATH.exists():
-    st.error(f"엑셀 파일을 찾을 수 없습니다: {EXCEL_PATH}")
-    st.stop()
+    uploaded = st.file_uploader("엑셀 파일 업로드 (.xlsx)", type=["xlsx"])
 
-sheets = load_sheets(str(EXCEL_PATH))
+    if uploaded is None:
+        st.info("Rule Reminder Card / Error Spotlight / 교재 Practice 문항 시트가 들어있는 "
+                "엑셀 파일을 업로드해 주세요. (각 시트는 '챕터', 'Cell (개념)' 컬럼을 포함해야 합니다)")
+        st.stop()
 
-tabs = st.tabs(["Rule Reminder", "Error Spotlight", "Practice Ref", "전체 미리보기"])
+    dfs = load_and_prepare(uploaded.getvalue())
 
-generated_images = {}
+    missing = [k for k, v in dfs.items() if v is None]
+    if missing:
+        st.warning(f"다음 시트를 찾지 못했습니다: {missing}. 시트 이름에 'Rule Reminder', "
+                   f"'Error Spotlight', 'Practice' 라는 단어가 포함되어 있는지 확인해 주세요.")
 
-for tab, (key, meta) in zip(tabs[:3], SHEETS.items()):
-    with tab:
-        df = sheets.get(key)
-        if df is None:
-            st.warning(f"'{key}' 시트를 엑셀에서 찾을 수 없습니다.")
-            continue
+    groups = build_groups(dfs)
 
-        st.subheader(meta["title"])
-        st.dataframe(df, use_container_width=True, hide_index=True)
+    if not groups:
+        st.error("Cell 그룹을 만들 수 없습니다. 엑셀 구조를 확인해 주세요.")
+        st.stop()
 
-        img = render_table_image(
-            meta["title"], df,
-            center_cols=meta["center_cols"],
-            col_width_ratios=COL_RATIOS[key],
-        )
-        generated_images[key] = img
+    chapters = list(dict.fromkeys(g["chapter"] for g in groups))
 
-        st.image(img, use_container_width=True)
+    all_images = {}  # filename -> PIL Image
 
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        st.download_button(
-            label=f"⬇ {key}.png 다운로드",
-            data=buf.getvalue(),
-            file_name=f"{key}.png",
-            mime="image/png",
-            key=f"dl_{key}",
-        )
+    chapter_tabs = st.tabs(chapters)
 
-with tabs[3]:
-    st.subheader("전체 미리보기 & 일괄 다운로드")
-    for key, meta in SHEETS.items():
-        if key in generated_images:
-            st.markdown(f"**{meta['title']}**")
-            st.image(generated_images[key], use_container_width=True)
+    for tab, chapter in zip(chapter_tabs, chapters):
+        with tab:
+            chapter_groups = [g for g in groups if g["chapter"] == chapter]
+            for g in chapter_groups:
+                img = render_combined_cell_image(g)
+                if img is None:
+                    continue
+                fname = safe_filename(g["chapter"], g["cell"]) + ".png"
+                all_images[fname] = img
 
-    if len(generated_images) == 3:
-        import zipfile
+                with st.expander(f"🔹 {g['cell']}", expanded=True):
+                    st.image(img, use_container_width=True)
+                    buf = io.BytesIO()
+                    img.save(buf, format="PNG")
+                    st.download_button(
+                        label=f"⬇ {fname} 다운로드",
+                        data=buf.getvalue(),
+                        file_name=fname,
+                        mime="image/png",
+                        key=f"dl_{fname}",
+                    )
 
+    st.divider()
+    st.subheader(f"전체 {len(all_images)}개 이미지 ZIP 다운로드")
+    if all_images:
         zip_buf = io.BytesIO()
         with zipfile.ZipFile(zip_buf, "w") as zf:
-            for key, img in generated_images.items():
+            for fname, img in all_images.items():
                 b = io.BytesIO()
                 img.save(b, format="PNG")
-                zf.writestr(f"{key}.png", b.getvalue())
+                zf.writestr(fname, b.getvalue())
         st.download_button(
-            label="⬇ 3개 이미지 ZIP으로 다운로드",
+            label="⬇ 전체 이미지 ZIP으로 다운로드",
             data=zip_buf.getvalue(),
-            file_name="grammar_cards.zip",
+            file_name="cell_combined_cards.zip",
             mime="application/zip",
         )
+
+
+if __name__ == "__main__":
+    main()
