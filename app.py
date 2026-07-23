@@ -8,6 +8,8 @@ Cell 통합 카드 이미지 생성기 (Streamlit)
 import io
 import re
 import zipfile
+from functools import lru_cache
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -16,8 +18,42 @@ from PIL import Image, ImageDraw, ImageFont
 # ------------------------------------------------------------------
 # 기본 설정
 # ------------------------------------------------------------------
-FONT_REGULAR = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
-FONT_BOLD = "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"
+# 폰트는 서버 환경(OS)에 무관하게 항상 동작하도록 앱과 함께 배포되는
+# fonts/ 폴더의 파일을 사용한다 (시스템 폰트 경로에 의존하지 않음).
+FONTS_DIR = Path(__file__).parent / "fonts"
+
+FONT_FILES = {
+    "title_regular": FONTS_DIR / "Know_Regular.ttf",   # 아는체 Regular - 제목용
+    "title_bold": FONTS_DIR / "Know_Bold.ttf",         # 아는체 Bold - 제목용
+    "body_light": FONTS_DIR / "Do_Light.ttf",          # 하는체 Light - 본문용
+    "body_regular": FONTS_DIR / "Do_Regular.ttf",      # 하는체 Regular - 본문용
+    "body_bold": FONTS_DIR / "Do_Bold.ttf",            # 하는체 Bold - 본문용
+}
+
+_missing_font_warned = set()
+
+
+@lru_cache(maxsize=64)
+def get_font(style: str, size: int):
+    """스타일(title_bold/title_regular/body_bold/body_regular/body_light)별
+    폰트를 불러온다. 파일이 없으면 PIL 기본 폰트로 대체하고 1회만 경고한다."""
+    path = FONT_FILES.get(style)
+    if path is not None and path.exists():
+        try:
+            return ImageFont.truetype(str(path), size)
+        except OSError:
+            pass
+    if style not in _missing_font_warned:
+        _missing_font_warned.add(style)
+        try:
+            st.warning(
+                f"'{style}' 폰트 파일을 찾을 수 없어 기본 폰트로 대체합니다. "
+                f"(fonts/ 폴더에 해당 파일이 있는지 확인해 주세요: {path})"
+            )
+        except Exception:
+            pass
+    return ImageFont.load_default()
+
 
 TOTAL_WIDTH = 1400
 PAD = 16
@@ -37,6 +73,7 @@ SHEET_KEYWORDS = {
     "error": ["error spotlight", "error_spotlight"],
     "practice": ["practice"],
 }
+
 
 SECTION_META = {
     "rule": {"label": "Rule Reminder", "color": RULE_COLOR, "center_cols": [0]},
@@ -116,10 +153,6 @@ def build_groups(dfs):
 # ------------------------------------------------------------------
 # 이미지 렌더링 (표 하나)
 # ------------------------------------------------------------------
-def _font(size, bold=False):
-    return ImageFont.truetype(FONT_BOLD if bold else FONT_REGULAR, size)
-
-
 def _wrap_text(draw, text, font, max_width):
     lines = []
     for raw_line in str(text).split("\n"):
@@ -148,9 +181,9 @@ def render_section_image(label, color, df, col_width_ratios, center_cols):
     ratio_sum = sum(col_width_ratios)
     col_widths = [int(TOTAL_WIDTH * r / ratio_sum) for r in col_width_ratios]
 
-    header_font = _font(17, bold=True)
-    body_font = _font(16)
-    label_font = _font(16, bold=True)
+    header_font = get_font("body_bold", 17)
+    body_font = get_font("body_regular", 16)
+    label_font = get_font("title_bold", 17)
 
     dummy = ImageDraw.Draw(Image.new("RGB", (10, 10)))
 
