@@ -123,7 +123,9 @@ def measure_text_safe(draw, text, font):
 
 
 def draw_text_safe(draw, xy, text, font, fill):
-    """font에 없는 문자는 폴백 폰트로 그려서 네모(□)로 깨지는 것을 방지."""
+    """font에 없는 문자는 폴백 폰트로 그려서 네모(□)로 깨지는 것을 방지.
+    폰트마다 ascent(기준선 위 높이)가 달라서 그냥 같은 y에 그리면 폴백 글자가
+    아래/위로 밀려 보이므로, 기준선(baseline)이 맞도록 y를 보정한다."""
     cmap = getattr(font, "_cmap", None)
     if not text:
         return
@@ -131,10 +133,14 @@ def draw_text_safe(draw, xy, text, font, fill):
         draw.text(xy, text, font=font, fill=fill)
         return
     fb_font = get_fallback_font(getattr(font, "size", 16))
+    primary_ascent, _ = font.getmetrics()
+    fallback_ascent, _ = fb_font.getmetrics()
+    y_shift = primary_ascent - fallback_ascent
     x, y = xy
     for ch in text:
         use_font = font if (ord(ch) in cmap or ch == " ") else fb_font
-        draw.text((x, y), ch, font=use_font, fill=fill)
+        draw_y = y if use_font is font else y + y_shift
+        draw.text((x, draw_y), ch, font=use_font, fill=fill)
         x += draw.textlength(ch, font=use_font)
 
 
