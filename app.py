@@ -419,10 +419,40 @@ def render_combined_cell_image(group, practice_mode="answer"):
     return combined
 
 
-def safe_filename(chapter, cell):
-    text = f"{chapter}_{cell}"
-    text = re.sub(r"[^0-9A-Za-z가-힣]+", "_", text).strip("_")
-    return text
+LEVEL_RE = re.compile(r"(?:^|[_\-\.\s])([HE])(?:[_\-\.\s]|$)")
+
+
+def extract_level_from_filename(filename: str):
+    """업로드 파일명에서 레벨 코드(H 또는 E)를 찾는다.
+    예: 'CH1-3_문법정리_H.xlsx' -> 'H', 'CH1-3_문법정리_E.xlsx' -> 'E'.
+    못 찾으면 None."""
+    stem = re.sub(r"\.[A-Za-z0-9]+$", "", filename)
+    m = LEVEL_RE.search(stem)
+    if m:
+        return m.group(1)
+    # 마지막 글자가 H/E인 경우도 보조로 체크 (예: '...H')
+    if stem and stem[-1] in ("H", "E"):
+        return stem[-1]
+    return None
+
+
+CHAPTER_NUM_RE = re.compile(r"ch\s*0*([0-9]+)", re.IGNORECASE)
+
+
+def extract_chapter_num(chapter_text: str):
+    """'CH1. 문장의 형식' -> '01' (2자리 0채움). 못 찾으면 원문 그대로."""
+    m = CHAPTER_NUM_RE.search(str(chapter_text))
+    if m:
+        return f"{int(m.group(1)):02d}"
+    return re.sub(r"[^0-9A-Za-z가-힣]+", "", str(chapter_text)) or "00"
+
+
+def build_filename(level: str, chapter_text: str, cell_num: str, variant: str) -> str:
+    """BOOST-GR-{레벨}-CH{챕터 2자리}-C{셀번호}-{1=정답/2=문제}.png 형식."""
+    level = level or "X"
+    chapter_num = extract_chapter_num(chapter_text)
+    cell_num = re.sub(r"[^0-9A-Za-z가-힣]+", "", str(cell_num)) or "0"
+    return f"BOOST-GR-{level}-CH{chapter_num}-C{cell_num}-{variant}"
 
 
 # ------------------------------------------------------------------
@@ -449,6 +479,19 @@ def main():
         st.warning(f"다음 시트를 찾지 못했습니다: {missing}. 시트 이름에 'Rule Reminder', "
                    f"'Error Spotlight', 'Practice' 라는 단어가 포함되어 있는지 확인해 주세요.")
 
+    detected_level = extract_level_from_filename(uploaded.name)
+    col_a, col_b = st.columns([1, 3])
+    with col_a:
+        level = st.text_input(
+            "레벨 코드 (파일명용)",
+            value=detected_level or "",
+            max_chars=2,
+            help="파일명이 'BOOST-GR-{레벨}-...' 형식으로 만들어집니다. "
+                 "업로드한 엑셀 파일명에서 자동으로 찾은 값이며, 다르면 직접 수정하세요.",
+        ).strip().upper()
+    if not detected_level:
+        st.warning("업로드한 파일명에서 레벨 코드(H/E)를 찾지 못했습니다. 위 칸에 직접 입력해 주세요.")
+
     groups = build_groups(dfs)
 
     if not groups:
@@ -465,15 +508,15 @@ def main():
         with tab:
             chapter_groups = [g for g in groups if g["chapter"] == chapter]
             for g in chapter_groups:
-                base_fname = safe_filename(g["chapter"], g["cell"])
+                cell_num = extract_cell_num(g["cell"])
 
                 img_answer = render_combined_cell_image(g, practice_mode="answer")
                 img_quiz = render_combined_cell_image(g, practice_mode="quiz")
                 if img_answer is None:
                     continue
 
-                fname_answer = f"{base_fname}_정답.png"
-                fname_quiz = f"{base_fname}_문제.png"
+                fname_answer = build_filename(level, g["chapter"], cell_num, "1") + ".png"
+                fname_quiz = build_filename(level, g["chapter"], cell_num, "2") + ".png"
                 all_images[fname_answer] = img_answer
                 if img_quiz is not None:
                     all_images[fname_quiz] = img_quiz
