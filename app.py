@@ -41,6 +41,10 @@ SYMBOL_REPLACEMENTS = {
     "☒": "(X)",
     "❌": "(X)",
     "✅": "(O)",
+    "—": "―",   # em dash(U+2014, 폰트에 없음) -> horizontal bar(U+2015, 폰트에 있음)
+    "–": "―",   # en dash(U+2013, 폰트에 없음) -> horizontal bar
+    "‐": "-",   # hyphen(U+2010, 폰트에 없음) -> hyphen-minus
+    "−": "-",   # minus sign(U+2212, 폰트에 없음) -> hyphen-minus
 }
 
 # 위 치환 사전에도 없는 미지의 문자가 나올 경우를 대비한 안전망 폴백 폰트
