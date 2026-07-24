@@ -515,8 +515,8 @@ def main():
                 if img_answer is None:
                     continue
 
-                fname_answer = build_filename(level, g["chapter"], cell_num, "1") + ".png"
-                fname_quiz = build_filename(level, g["chapter"], cell_num, "2") + ".png"
+                fname_answer = build_filename(level, g["chapter"], cell_num, "2") + ".png"
+                fname_quiz = build_filename(level, g["chapter"], cell_num, "1") + ".png"
                 all_images[fname_answer] = img_answer
                 if img_quiz is not None:
                     all_images[fname_quiz] = img_quiz
