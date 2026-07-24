@@ -30,7 +30,52 @@ FONT_FILES = {
     "body_bold": FONTS_DIR / "Do_Bold.ttf",            # 하는체 Bold - 본문용
 }
 
+# 커스텀 폰트(아는체/하는체)에 글리프가 없는 특수문자를 안전하게 치환한다.
+# (예: ⚠ -> 네모(□)로 깨짐, ✓/✗ -> 깨짐)
+SYMBOL_REPLACEMENTS = {
+    "⚠": "※",
+    "✓": "(O)",
+    "✗": "(X)",
+    "∙": "·",
+    "☑": "(O)",
+    "☒": "(X)",
+    "❌": "(X)",
+    "✅": "(O)",
+}
+
+# 위 치환 사전에도 없는 미지의 문자가 나올 경우를 대비한 안전망 폴백 폰트
+# (Noto Sans CJK에서 기호/문장부호 영역만 추출한 경량 서브셋)
+FALLBACK_FONT_FILE = FONTS_DIR / "NotoFallback-Regular.ttf"
+
 _missing_font_warned = set()
+
+
+def sanitize_text(text: str) -> str:
+    """폰트에 없는 것으로 확인된 특수문자를 안전한 문자로 치환."""
+    for bad, good in SYMBOL_REPLACEMENTS.items():
+        if bad in text:
+            text = text.replace(bad, good)
+    return text
+
+
+@lru_cache(maxsize=8)
+def _cmap_for(path_str: str):
+    """폰트 파일의 지원 코드포인트 집합 (커버리지 체크용, 실패 시 None)."""
+    try:
+        from fontTools.ttLib import TTFont
+        return frozenset(TTFont(path_str).getBestCmap().keys())
+    except Exception:
+        return None
+
+
+@lru_cache(maxsize=8)
+def get_fallback_font(size: int):
+    if FALLBACK_FONT_FILE.exists():
+        try:
+            return ImageFont.truetype(str(FALLBACK_FONT_FILE), size)
+        except OSError:
+            pass
+    return ImageFont.load_default()
 
 
 @lru_cache(maxsize=64)
@@ -40,7 +85,9 @@ def get_font(style: str, size: int):
     path = FONT_FILES.get(style)
     if path is not None and path.exists():
         try:
-            return ImageFont.truetype(str(path), size)
+            font = ImageFont.truetype(str(path), size)
+            font._cmap = _cmap_for(str(path))  # 커버리지 체크용 (없으면 None)
+            return font
         except OSError:
             pass
     if style not in _missing_font_warned:
@@ -52,7 +99,39 @@ def get_font(style: str, size: int):
             )
         except Exception:
             pass
-    return ImageFont.load_default()
+    font = ImageFont.load_default()
+    font._cmap = None
+    return font
+
+
+def measure_text_safe(draw, text, font):
+    """font에 없는 문자는 폴백 폰트 폭으로 계산해서 정확한 폭을 반환."""
+    cmap = getattr(font, "_cmap", None)
+    if not text:
+        return 0
+    if cmap is None or all(ord(ch) in cmap or ch == " " for ch in text):
+        return draw.textlength(text, font=font)
+    fb_font = get_fallback_font(getattr(font, "size", 16))
+    return sum(
+        draw.textlength(ch, font=(font if (ord(ch) in cmap or ch == " ") else fb_font))
+        for ch in text
+    )
+
+
+def draw_text_safe(draw, xy, text, font, fill):
+    """font에 없는 문자는 폴백 폰트로 그려서 네모(□)로 깨지는 것을 방지."""
+    cmap = getattr(font, "_cmap", None)
+    if not text:
+        return
+    if cmap is None or all(ord(ch) in cmap or ch == " " for ch in text):
+        draw.text(xy, text, font=font, fill=fill)
+        return
+    fb_font = get_fallback_font(getattr(font, "size", 16))
+    x, y = xy
+    for ch in text:
+        use_font = font if (ord(ch) in cmap or ch == " ") else fb_font
+        draw.text((x, y), ch, font=use_font, fill=fill)
+        x += draw.textlength(ch, font=use_font)
 
 
 TOTAL_WIDTH = 1400
@@ -154,15 +233,16 @@ def build_groups(dfs):
 # 이미지 렌더링 (표 하나)
 # ------------------------------------------------------------------
 def _wrap_text(draw, text, font, max_width):
+    text = sanitize_text(str(text))
     lines = []
-    for raw_line in str(text).split("\n"):
+    for raw_line in text.split("\n"):
         if raw_line == "":
             lines.append("")
             continue
         current = ""
         for ch in raw_line:
             trial = current + ch
-            if draw.textlength(trial, font=font) > max_width and current:
+            if measure_text_safe(draw, trial, font) > max_width and current:
                 lines.append(current)
                 current = ch
             else:
@@ -212,7 +292,7 @@ def render_section_image(label, color, df, col_width_ratios, center_cols):
 
     # 섹션 라벨 배너
     draw.rectangle([0, 0, TOTAL_WIDTH, label_h], fill=color)
-    draw.text((PAD, 7), label, font=label_font, fill=(20, 20, 20))
+    draw_text_safe(draw, (PAD, 7), label, label_font, (20, 20, 20))
     y = label_h
 
     # 표 헤더
@@ -224,9 +304,9 @@ def render_section_image(label, color, df, col_width_ratios, center_cols):
         block_h = len(lines) * LINE_H
         ty = y + (header_h - block_h) // 2
         for line in lines:
-            tw = draw.textlength(line, font=header_font)
+            tw = measure_text_safe(draw, line, header_font)
             tx = x + (col_widths[c] - tw) // 2
-            draw.text((tx, ty), line, font=header_font, fill=(20, 20, 20))
+            draw_text_safe(draw, (tx, ty), line, header_font, (20, 20, 20))
             ty += LINE_H
         x += col_widths[c]
     y += header_h
@@ -242,9 +322,9 @@ def render_section_image(label, color, df, col_width_ratios, center_cols):
             ty = y + (row_h - block_h) // 2
             centered = c in center_cols
             for line in lines:
-                tw = draw.textlength(line, font=body_font)
+                tw = measure_text_safe(draw, line, body_font)
                 tx = x + (col_widths[c] - tw) // 2 if centered else x + PAD
-                draw.text((tx, ty), line, font=body_font, fill=TEXT_COLOR)
+                draw_text_safe(draw, (tx, ty), line, body_font, TEXT_COLOR)
                 ty += LINE_H
             x += col_widths[c]
         y += row_h
@@ -270,12 +350,28 @@ COL_RATIOS = {
 GAP = 14  # 섹션 사이 여백
 
 
-def render_combined_cell_image(group):
+def make_quiz_practice_df(practice_df):
+    """Practice 표의 '정답' 관련 컬럼을 '정답은?' 문구로 가려서 빈칸 연습용 버전을 만든다."""
+    if practice_df is None or len(practice_df) == 0:
+        return practice_df
+    df = practice_df.copy()
+    answer_cols = [c for c in df.columns if "정답" in str(c)]
+    target_cols = answer_cols if answer_cols else df.columns[-1:]
+    for c in target_cols:
+        df[c] = "정답은?"
+    return df
+
+
+def render_combined_cell_image(group, practice_mode="answer"):
+    """practice_mode: 'answer' (정답·해설 포함) 또는 'quiz' (정답 가림)."""
     sections = []
     for key in ["rule", "error", "practice"]:
         meta = SECTION_META[key]
+        df = group.get(key)
+        if key == "practice" and practice_mode == "quiz":
+            df = make_quiz_practice_df(df)
         img = render_section_image(
-            meta["label"], meta["color"], group.get(key),
+            meta["label"], meta["color"], df,
             COL_RATIOS[key], meta["center_cols"],
         )
         if img is not None:
@@ -308,7 +404,7 @@ def main():
     st.title("📘 Cell 통합 카드 이미지 생성기")
     st.caption(
         "엑셀을 업로드하면 '챕터 + Cell(개념)' 단위로 Rule Reminder / Error Spotlight / "
-        "Practice 내용을 하나로 합친 이미지를 Cell마다 1장씩 만들어 드립니다."
+        "Practice 내용을 하나로 합친 이미지를 Cell마다 2장(정답 포함 / 빈칸 연습용)씩 만들어 드립니다."
     )
 
     uploaded = st.file_uploader("엑셀 파일 업로드 (.xlsx)", type=["xlsx"])
@@ -341,23 +437,48 @@ def main():
         with tab:
             chapter_groups = [g for g in groups if g["chapter"] == chapter]
             for g in chapter_groups:
-                img = render_combined_cell_image(g)
-                if img is None:
+                base_fname = safe_filename(g["chapter"], g["cell"])
+
+                img_answer = render_combined_cell_image(g, practice_mode="answer")
+                img_quiz = render_combined_cell_image(g, practice_mode="quiz")
+                if img_answer is None:
                     continue
-                fname = safe_filename(g["chapter"], g["cell"]) + ".png"
-                all_images[fname] = img
+
+                fname_answer = f"{base_fname}_정답.png"
+                fname_quiz = f"{base_fname}_문제.png"
+                all_images[fname_answer] = img_answer
+                if img_quiz is not None:
+                    all_images[fname_quiz] = img_quiz
 
                 with st.expander(f"🔹 {g['cell']}", expanded=True):
-                    st.image(img, use_container_width=True)
-                    buf = io.BytesIO()
-                    img.save(buf, format="PNG")
-                    st.download_button(
-                        label=f"⬇ {fname} 다운로드",
-                        data=buf.getvalue(),
-                        file_name=fname,
-                        mime="image/png",
-                        key=f"dl_{fname}",
-                    )
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.caption("✅ 정답·해설 포함")
+                        st.image(img_answer, use_container_width=True)
+                        buf = io.BytesIO()
+                        img_answer.save(buf, format="PNG")
+                        st.download_button(
+                            label=f"⬇ {fname_answer} 다운로드",
+                            data=buf.getvalue(),
+                            file_name=fname_answer,
+                            mime="image/png",
+                            key=f"dl_{fname_answer}",
+                        )
+                    with col2:
+                        st.caption("📝 빈칸 연습용 (정답 가림)")
+                        if img_quiz is not None:
+                            st.image(img_quiz, use_container_width=True)
+                            buf2 = io.BytesIO()
+                            img_quiz.save(buf2, format="PNG")
+                            st.download_button(
+                                label=f"⬇ {fname_quiz} 다운로드",
+                                data=buf2.getvalue(),
+                                file_name=fname_quiz,
+                                mime="image/png",
+                                key=f"dl_{fname_quiz}",
+                            )
+                        else:
+                            st.caption("(Practice 내용 없음)")
 
     st.divider()
     st.subheader(f"전체 {len(all_images)}개 이미지 ZIP 다운로드")
