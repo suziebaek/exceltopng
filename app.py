@@ -200,33 +200,57 @@ def load_and_prepare(file_bytes):
     return dfs
 
 
+CELL_NUM_RE = re.compile(r"cell\s*0*([0-9]+)", re.IGNORECASE)
+
+
+def extract_cell_num(cell_text):
+    """'Cell 1. 조동사의 종류와 강도 Ⅰ (의무·허락·요청)' -> '1'
+    시트마다 Cell 뒤 설명 문구가 조금씩 달라도(괄호 유무 등) 같은 Cell로 묶기 위해
+    'Cell 번호'만 추출해서 그룹 키로 사용한다. 번호를 못 찾으면 원문 텍스트를 그대로 키로 사용."""
+    m = CELL_NUM_RE.search(str(cell_text))
+    if m:
+        return m.group(1)
+    return str(cell_text).strip()
+
+
 def ordered_pairs(df):
-    """(챕터, Cell) 조합을 최초 등장 순서대로 반환."""
+    """(챕터, Cell번호, 원문 Cell텍스트) 조합을 최초 등장 순서대로 반환."""
     if df is None:
         return []
     pairs = df.iloc[:, [0, 1]].drop_duplicates()
-    return list(pairs.itertuples(index=False, name=None))
+    result = []
+    for chapter, cell_text in pairs.itertuples(index=False, name=None):
+        result.append((chapter, extract_cell_num(cell_text), cell_text))
+    return result
 
 
 def build_groups(dfs):
-    """모든 시트를 통틀어 (챕터, Cell) 그룹 목록 생성 (등장 순서 유지)."""
+    """모든 시트를 통틀어 (챕터, Cell번호) 그룹 목록 생성 (등장 순서 유지).
+    시트별로 Cell 설명 문구가 정확히 일치하지 않아도 Cell 번호만 같으면 하나로 묶는다."""
     seen = []
     seen_set = set()
+    display_text = {}  # (chapter, cell_num) -> 대표로 보여줄 Cell 텍스트 (가장 긴 것 사용)
     for key in ["rule", "error", "practice"]:
-        for pair in ordered_pairs(dfs.get(key)):
-            if pair not in seen_set:
-                seen_set.add(pair)
-                seen.append(pair)
+        for chapter, cell_num, cell_text in ordered_pairs(dfs.get(key)):
+            gkey = (chapter, cell_num)
+            if gkey not in seen_set:
+                seen_set.add(gkey)
+                seen.append(gkey)
+            # 여러 시트 중 가장 설명이 풍부한(긴) 텍스트를 대표 라벨로 채택
+            if gkey not in display_text or len(str(cell_text)) > len(str(display_text[gkey])):
+                display_text[gkey] = cell_text
 
     groups = []
-    for chapter, cell in seen:
-        entry = {"chapter": chapter, "cell": cell}
+    for chapter, cell_num in seen:
+        cell_label = display_text[(chapter, cell_num)]
+        entry = {"chapter": chapter, "cell": cell_label}
         for key in ["rule", "error", "practice"]:
             df = dfs.get(key)
             if df is None:
                 entry[key] = None
                 continue
-            sub = df[(df.iloc[:, 0] == chapter) & (df.iloc[:, 1] == cell)]
+            row_cell_nums = df.iloc[:, 1].apply(extract_cell_num)
+            sub = df[(df.iloc[:, 0] == chapter) & (row_cell_nums == cell_num)]
             content_cols = df.columns[2:]
             entry[key] = sub[content_cols].reset_index(drop=True)
         groups.append(entry)
